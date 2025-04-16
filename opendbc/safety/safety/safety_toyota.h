@@ -4,7 +4,7 @@
 
 // Stock longitudinal
 #define TOYOTA_BASE_TX_MSGS \
-  {0x191, 0, 8, false}, {0x412, 0, 8, false}, {0x1D2, 0, 8, false},  /* LKAS + LTA + PCM cancel cmd */  \
+  {0x191, 0, 8, false}, {0x412, 0, 8, false}, {0x1D2, 0, 8, false}, {0x750, 0, 8, false}, /* sp - white list 0x750 for Enhanced Diagnostic Request */ /* LKAS + LTA + PCM cancel cmd */  \
 
 #define TOYOTA_COMMON_TX_MSGS \
   TOYOTA_BASE_TX_MSGS \
@@ -352,14 +352,34 @@ static bool toyota_tx_hook(const CANPacket_t *to_send) {
         }
       }
     }
+    // SP: auto brake hold https://github.com/AlexandreSato
+    if ((addr == 0x344) && (alternative_experience & ALT_EXP_ALLOW_AEB)) {
+      if (vehicle_moving || gas_pressed || !acc_main_on) {
+        tx = false;
+      }
+    }
   }
 
   // UDS: Only tester present ("\x0F\x02\x3E\x00\x00\x00\x00\x00") allowed on diagnostics address
   if (addr == 0x750) {
     // this address is sub-addressed. only allow tester present to radar (0xF)
     bool invalid_uds_msg = (GET_BYTES(to_send, 0, 4) != 0x003E020FU) || (GET_BYTES(to_send, 4, 4) != 0x0U);
-    if (invalid_uds_msg) {
-      tx = 0;
+    // SP: Secret sauce from dp. (ask @rav4kumar prior to modifing)
+    // Enhanced BSM
+    bool sp_valid_uds_msgs = ((GET_BYTES(to_send, 0, 4) == 0x10002141U) ||  // disable left BSM debug
+                              (GET_BYTES(to_send, 0, 4) == 0x60100241U) ||  // enable left BSM debug
+                              (GET_BYTES(to_send, 0, 4) == 0x69210241U) ||  // poll left BSM status
+                              (GET_BYTES(to_send, 0, 4) == 0x10002142U) ||  // disable right BSM debug
+                              (GET_BYTES(to_send, 0, 4) == 0x60100242U) ||  // enable right BSM debug
+                              (GET_BYTES(to_send, 0, 4) == 0x69210242U))    // poll right BSM status
+                              && (GET_BYTES(to_send, 4, 4) == 0x0U);
+
+    sp_valid_uds_msgs |= (GET_BYTES(to_send, 0, 4) == 0x11300540U) &&       // automatic door locking and unlocking
+                         ((GET_BYTES(to_send, 4, 4) == 0x00004000U) ||      // unlock
+                          (GET_BYTES(to_send, 4, 4) == 0x00008000U));       // lock
+
+    if (invalid_uds_msg && !sp_valid_uds_msgs) {
+      tx = false;
     }
   }
 
@@ -479,11 +499,13 @@ static bool toyota_fwd_hook(int bus_num, int addr) {
     bool is_lkas_msg = ((addr == 0x2E4) || (addr == 0x412) || (addr == 0x191));
     // in TSS2 the camera does ACC as well, so filter 0x343
     bool is_acc_msg = (addr == 0x343);
-
     // SecOC cars use additional (not alternate) messages for lateral and longitudinal actuation
     is_lkas_msg |= toyota_secoc && (addr == 0x131);
     is_acc_msg |= toyota_secoc && (addr == 0x183);
-    block_msg = is_lkas_msg || (is_acc_msg && !toyota_stock_longitudinal);
+    // SP: block AEB when auto brake hold is active, unblock AEB when auto brake hold is not active
+    bool is_aeb_msg = (addr == 0x344);
+    block_msg = is_lkas_msg || (is_acc_msg && !toyota_stock_longitudinal) ||
+                     (is_aeb_msg && (alternative_experience & ALT_EXP_ALLOW_AEB) && !vehicle_moving && !gas_pressed && acc_main_on);
   }
 
   return block_msg;
